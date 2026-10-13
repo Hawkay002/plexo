@@ -1,10 +1,12 @@
 import { Api, TelegramClient } from 'telegram'
+import { LAYER } from 'telegram/tl/AllTLObjects'
 import { StringSession } from 'telegram/sessions'
 import { sendCode } from 'telegram/client/auth'
 import { computeCheck } from 'telegram/Password'
 import { FloodWaitError, FileMigrateError } from 'telegram/errors'
 import { strippedPhotoToJpg } from 'telegram/Utils'
 import { LogLevel } from 'telegram/extensions/Logger'
+import type { MTProtoSender } from 'telegram/network'
 import bigInt from 'big-integer'
 import { app, safeStorage } from 'electron'
 import { readFile, rm, writeFile } from 'node:fs/promises'
@@ -30,6 +32,10 @@ const STORE_PATH = (): string => join(app.getPath('userData'), 'telegram-auth.js
 
 /** Listing page size, and the most messages one listing request may return. */
 const LIST_PAGE = 50
+
+/** Independent connections a download may open to its file's data center, all under the one
+ * login — the shape of a fast download in Telegram's own desktop client. */
+const FILE_SENDER_POOL = 8
 
 interface StoredAuth {
   /** Sealed (safeStorage) or plain JSON of TelegramCredentials. */
@@ -536,9 +542,7 @@ export class TelegramService {
   }
 
   /** What starting a download shows before it begins: its name and size. */
-  async mediaInfo(
-    messageId: number
-  ): Promise<{
+  async mediaInfo(messageId: number): Promise<{
     fileName: string
     totalBytes: number
     mimeType: string
@@ -555,7 +559,11 @@ export class TelegramService {
 
   /** The bytes of one media file, for a download's transfer. The location is looked up lazily
    * (on the first request), and refetched when Telegram says its reference went stale — which
-   * it does within a day, so a paused download's resume rebuilds it rather than failing. */
+   * it does within a day, so a paused download's resume rebuilds it rather than failing.
+   *
+   * Chunks rotate across a small pool of independent connections to the file's data center,
+   * all under this one login — the shape of a fast download in Telegram's own desktop client.
+   * The connections this source opened are closed when the download is done with it. */
   async fileSource(messageId: number): Promise<TelegramFileSource> {
     const client = await this.ready()
     let located: LocatedMedia | null = null
@@ -567,22 +575,56 @@ export class TelegramService {
       }
     }
 
-    const requestOnce = async (
-      info: LocatedMedia,
+    // One entry per connection: `owned` marks the ones dispose() may close (a GramJS-borrowed
+    // fallback is the client's own shared sender, which must outlive this download), and
+    // `load` is its requests in flight — chunks go to the least-loaded connection.
+    interface Connection {
+      sender: MTProtoSender
+      owned: boolean
+      load: number
+    }
+    const pool: Connection[] = []
+    let sourceDisposed = false
+
+    const disposePool = async (): Promise<void> => {
+      const entries = pool.splice(0, pool.length)
+      for (const entry of entries) {
+        if (!entry.owned) continue
+        await entry.sender.disconnect().catch(() => {})
+      }
+    }
+
+    const requestChunk = async (
       offset: number,
-      limit: number
+      limit: number,
+      guard: AbortSignal
     ): Promise<Buffer> => {
+      // A connection with nothing in flight takes the chunk without an await in between, so
+      // simultaneous readers spread out instead of piling onto the same one.
+      let entry: Connection | undefined
+      for (const candidate of pool) {
+        if (candidate.load === 0) {
+          entry = candidate
+          break
+        }
+        if (!entry || candidate.load < entry.load) entry = candidate
+      }
+      if (!entry || (entry.load >= 1 && pool.length < FILE_SENDER_POOL)) {
+        const created = await this.createSender(located!.dcId)
+        entry = { sender: created.sender, owned: created.owned, load: 0 }
+        pool.push(entry)
+      }
+      entry.load += 1
       try {
-        const sender = await client.getSender(info.dcId)
         const request = client.invokeWithSender(
           new Api.upload.GetFile({
-            location: info.location,
+            location: located!.location,
             offset: bigInt(offset),
             limit
           }),
-          sender
+          entry.sender
         )
-        const result = await raceSignal(request, AbortSignal.timeout(30_000))
+        const result = await raceSignal(request, guard)
         if (result instanceof Api.upload.FileCdnRedirect) {
           throw new TelegramFileError(
             'other',
@@ -591,26 +633,16 @@ export class TelegramService {
         }
         return result.bytes
       } catch (error) {
-        if (error instanceof TelegramFileError) throw error
-        if (error instanceof FileMigrateError) {
-          // Wrong DC borrowed: the file lives on another one.
-          const sender = await client.getSender(error.newDc)
-          const result = await raceSignal(
-            client.invokeWithSender(
-              new Api.upload.GetFile({ location: info.location, offset: bigInt(offset), limit }),
-              sender
-            ),
-            AbortSignal.timeout(30_000)
-          )
-          if (result instanceof Api.upload.FileCdnRedirect) {
-            throw new TelegramFileError(
-              'other',
-              'Telegram served this file from a CDN, which Plexo can’t fetch.'
-            )
-          }
-          return result.bytes
+        // A connection that hung until the guard's timeout is dropped: the next acquire
+        // builds a fresh one. (The reader's own abort leaves it be — the run is ending.)
+        if (guard.reason?.name === 'TimeoutError') {
+          const at = pool.indexOf(entry)
+          if (at >= 0) pool.splice(at, 1)
+          if (entry.owned) void entry.sender.disconnect().catch(() => {})
         }
-        throw asFileError(error)
+        throw error
+      } finally {
+        entry.load -= 1
       }
     }
 
@@ -618,23 +650,135 @@ export class TelegramService {
       get unknownSize(): boolean {
         return located?.size === null
       },
+      dispose: async (): Promise<void> => {
+        sourceDisposed = true
+        await disposePool()
+      },
       async request(offset: number, limit: number, signal: AbortSignal): Promise<Buffer> {
+        if (sourceDisposed) {
+          throw new TelegramFileError('other', 'This download was stopped.')
+        }
         if (!located) located = await locateNow()
+        // A hung connection must not hold a reader past half a minute; the transfer retries
+        // on this connection if it recovers, or the pool replaces it if it doesn't.
+        const guard = AbortSignal.any([signal, AbortSignal.timeout(30_000)])
         try {
-          return await requestOnce(located, offset, limit)
+          return await requestChunk(offset, limit, guard)
         } catch (error) {
-          if (error instanceof TelegramFileError) throw error
-          if (isFileReferenceError(error) && signal.aborted === false) {
+          if (error instanceof TelegramFileError || signal.aborted) throw error
+          if (isFileReferenceError(error)) {
             // The reference went stale: refetch the message and try the same chunk once more.
             located = await locateNow()
-            return await requestOnce(located, offset, limit)
+            return await requestChunk(offset, limit, guard)
           }
-          if (error instanceof FileMigrateError && signal.aborted === false) {
+          if (error instanceof FileMigrateError) {
+            // The connections target the wrong DC now: drop them and follow the file.
+            await disposePool()
             located = { ...located!, dcId: error.newDc }
-            return await requestOnce(located, offset, limit)
+            return await requestChunk(offset, limit, guard)
           }
-          throw error
+          throw asFileError(error)
         }
+      }
+    }
+  }
+
+  /** One fresh connection to `dcId` under this login: a GramJS exported sender, connected and
+   * authorized explicitly. The client's own connect helper is deliberately not used — it
+   * writes the authorization handshake into a shared init object, so several connections
+   * created at once clobber each other's handshake (AUTH_BYTES_INVALID). Falls back to the
+   * client's shared pooled sender when any of this fails. */
+  private async createSender(dcId: number): Promise<{ sender: MTProtoSender; owned: boolean }> {
+    const client = await this.ready()
+    const internals = client as unknown as {
+      _createExportedSender(dcId: number): MTProtoSender
+      _connection: new (options: {
+        ip: string
+        port: number
+        dcId: number
+        loggers: unknown
+        proxy: unknown
+        testServers: unknown
+        socket: unknown
+      }) => Parameters<MTProtoSender['connect']>[0]
+      _proxy: unknown
+      _log: unknown
+      testServers: unknown
+      networkSocket: unknown
+      _initRequest: Api.InvokeWithLayer
+      getSender(dcId: number): Promise<MTProtoSender>
+    }
+    let sender: MTProtoSender | undefined
+    try {
+      sender = internals._createExportedSender(dcId)
+      // The data center's address; an existing key for it says to ask the -1 test DC list
+      // instead, as the client's own connect helper does.
+      const hasKey = !!sender.authKey?.getKey()
+      const dc = await client.getDC(dcId, hasKey)
+      const connection = new internals._connection({
+        ip: dc.ipAddress,
+        port: dc.port,
+        dcId,
+        loggers: internals._log,
+        proxy: internals._proxy,
+        testServers: internals.testServers,
+        socket: internals.networkSocket
+      })
+      // A connection attempt that hangs (an unreachable DC) must not hold the download; the
+      // loser of the race is disconnected and the client's shared sender carries on instead.
+      const connecting = (async (): Promise<void> => {
+        await sender!.connect(connection, false)
+        // Another data center needs this login's authorization exported to it — per sender,
+        // with the client's own identity copied in rather than its shared init object.
+        if ((client.session.dcId ?? 0) !== dcId) {
+          const auth = await client.invoke(new Api.auth.ExportAuthorization({ dcId }))
+          const identity =
+            internals._initRequest.query instanceof Api.InitConnection
+              ? internals._initRequest.query
+              : undefined
+          await sender!.send(
+            new Api.InvokeWithLayer({
+              layer: LAYER,
+              query: new Api.InitConnection({
+                apiId: identity?.apiId ?? this.credentials!.apiId,
+                deviceModel: identity?.deviceModel ?? 'Desktop',
+                systemVersion: identity?.systemVersion ?? 'unknown',
+                appVersion: identity?.appVersion ?? 'Plexo',
+                systemLangCode: identity?.systemLangCode ?? 'en',
+                langPack: identity?.langPack ?? '',
+                langCode: identity?.langCode ?? 'en',
+                query: new Api.auth.ImportAuthorization({ id: auth.id, bytes: auth.bytes })
+              })
+            })
+          )
+        }
+        ;(sender as unknown as { dcId: number }).dcId = dcId
+      })()
+      void connecting.catch(() => {})
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('Timed out connecting to Telegram')),
+          15_000
+        )
+        timer.unref()
+        connecting.then(
+          () => {
+            clearTimeout(timer)
+            resolve()
+          },
+          (cause: unknown) => {
+            clearTimeout(timer)
+            reject(cause)
+          }
+        )
+      })
+      return { sender, owned: true }
+    } catch {
+      if (sender) void sender.disconnect().catch(() => {})
+      try {
+        return { sender: await internals.getSender(dcId), owned: false }
+      } catch (cause) {
+        throw new TelegramFileError('network', describeError(cause))
       }
     }
   }

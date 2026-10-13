@@ -25,6 +25,8 @@ export interface TelegramFileSource {
   /** True when the size is unknown (a photo): requests run until an empty answer. */
   unknownSize: boolean
   request(offset: number, limit: number, signal: AbortSignal): Promise<Buffer>
+  /** Closes the connections this source opened. Best-effort; safe to repeat. */
+  dispose(): Promise<void>
 }
 
 /** Why a request failed, as the transfer acts on it. */
@@ -43,9 +45,9 @@ export class TelegramFileError extends Error {
 
 /** upload.GetFile answers at most 1 MiB, at offsets and limits divisible by 4096. */
 export const FILE_CHUNK_BYTES = 1024 * 1024
-/** Concurrent getFile requests, pipelined over the one session. Telegram rate-limits past a
- * handful, and then every request costs a wait. */
-export const READER_POOL = 4
+/** Readers, each holding one dedicated connection to Telegram's DC under the same login —
+ * the shape of a fast download in Telegram's own desktop client. */
+export const READER_POOL = 8
 const MAX_RETRIES = 8
 const RETRY_BASE_MS = 1_000
 const RETRY_MAX_MS = 15_000
@@ -66,10 +68,20 @@ type BlockOutcome =
   | { type: 'retry'; waitMs: number }
   | { type: 'give-up'; error: unknown }
 
+/** A chunk request already in flight, settled with an Error rather than rejecting, so a
+ * prefetch outliving its reader can never be an unhandled rejection. */
+interface Prefetch {
+  block: HttpBlockState
+  /** The file offset this request asks for. */
+  offset: number
+  promise: Promise<Buffer | Error>
+}
+
 /**
- * Fetches a Telegram file: a small pool of readers, each claiming the first pending block and
- * fetching its remaining bytes in aligned chunks, written at their own offsets into the staging
- * file — the same shape the HTTP transfer writes, so pause/resume, progress and the block grid
+ * Fetches a Telegram file: a pool of readers, each on its own connection to the file's data
+ * center, claiming pending blocks and keeping its connection full — the next chunk request
+ * goes out before the current one is written. Chunks land at their own offsets in the staging
+ * file, the same shape the HTTP transfer writes, so pause/resume, progress and the block grid
  * all work unchanged. Telegram is reached however the OS routes, so a reader's bytes are
  * attributed to whichever network was first-enabled when it claimed its block.
  */
@@ -80,6 +92,8 @@ export class TelegramTransfer implements Transfer {
   private stopped = false
   /** The file source (a promise: it may need a round trip to Telegram to find the file). */
   private sourcePromise: Promise<TelegramFileSource> | undefined
+  /** Until when Telegram asked every connection to slow down (see asOutcome). */
+  private rateLimitedUntil = 0
 
   constructor(
     private readonly runtime: TelegramTransferTarget,
@@ -90,6 +104,20 @@ export class TelegramTransfer implements Transfer {
   private source(): Promise<TelegramFileSource> {
     this.sourcePromise ??= Promise.resolve(this.makeSource())
     return this.sourcePromise
+  }
+
+  /** Closes the source's connections and forgets it, so the next run builds a fresh one
+   * (whose message lookup also refreshes a stale file reference). */
+  private async disposeSource(): Promise<void> {
+    const promise = this.sourcePromise
+    this.sourcePromise = undefined
+    if (!promise) return
+    try {
+      const source = await promise
+      await source.dispose()
+    } catch {
+      // Best-effort: the source may itself have failed to open.
+    }
   }
 
   reconcile(): void {
@@ -121,19 +149,23 @@ export class TelegramTransfer implements Transfer {
   abort(): void {
     this.stopped = true
     for (const reader of this.readers.values()) reader.controller.abort()
+    void this.disposeSource()
   }
 
   reset(): void {
-    // A new run starts its pool over; blocks keep what they have on disk.
+    // A new run starts its pool over: fresh connections and a fresh message lookup; blocks
+    // keep what they have on disk.
     for (const reader of this.readers.values()) reader.controller.abort()
     this.readers.clear()
     this.workers.clear()
     this.stopped = false
+    this.rateLimitedUntil = 0
+    void this.disposeSource()
   }
 
   wake(): void {
-    // Nothing of this transfer's waits on a backoff that a network change should cut short: the
-    // readers retry on their own.
+    // Nothing of this transfer's waits on a backoff that a network change should cut short:
+    // the readers retry on their own.
   }
 
   systemResumed(): void {
@@ -143,6 +175,7 @@ export class TelegramTransfer implements Transfer {
     this.readers.clear()
     this.workers.clear()
     this.stopped = false
+    void this.disposeSource()
   }
 
   private addReader(): void {
@@ -171,6 +204,7 @@ export class TelegramTransfer implements Transfer {
         this.readers.delete(reader.id)
         const index = state.readers.indexOf(reader)
         if (index >= 0) state.readers.splice(index, 1)
+        if (this.workers.size === 0) void this.disposeSource()
         this.host.scheduleUpdate()
       })
     )
@@ -184,9 +218,40 @@ export class TelegramTransfer implements Transfer {
     return network
   }
 
+  /** Claims the first pending block for `reader`, synchronously — no other reader can take
+   * it between the find and here. */
+  private claimBlock(reader: TelegramReaderState): HttpBlockState | undefined {
+    const block = this.runtime.blocks.find((entry) => entry.status === 'pending')
+    if (!block) return undefined
+    block.status = 'downloading'
+    reader.interfaceId = this.networkOf(reader)?.id ?? reader.interfaceId
+    block.interfaceId = reader.interfaceId
+    reader.currentBlockIndex = block.index
+    reader.status = 'downloading'
+    this.host.scheduleUpdate()
+    return block
+  }
+
   private async runReader(reader: TelegramReaderState, self: ReaderRuntime): Promise<void> {
-    const { state, blocks } = this.runtime
+    const { state } = this.runtime
+    let source: TelegramFileSource
+    try {
+      source = await this.source()
+    } catch (cause) {
+      this.host.failDownload(describeError(cause))
+      reader.status = 'cancelled'
+      return
+    }
+
     while (state.status === 'downloading' && !self.controller.signal.aborted) {
+      // Telegram asked everyone to slow down: every reader waits out the remainder.
+      const rateWaitMs = this.rateLimitedUntil - Date.now()
+      if (rateWaitMs > 0) {
+        reader.status = 'retrying'
+        await delay(rateWaitMs, self.wait)
+        if ((this.runtime.state.status as DownloadStatus) !== 'downloading') break
+        continue
+      }
       if (!this.networkOf(reader)) {
         // No network is enabled right now: the manager pauses the download for this (see
         // reconcile), and the reader waits rather than spins.
@@ -194,34 +259,28 @@ export class TelegramTransfer implements Transfer {
         await delay(250, self.wait)
         continue
       }
-      const block = blocks.find((entry) => entry.status === 'pending')
+
+      const block = this.claimBlock(reader)
       if (!block) {
-        if (blocks.some((entry) => entry.status === 'downloading')) {
+        if (this.runtime.blocks.some((entry) => entry.status === 'downloading')) {
           // Stay available: a block in flight may be handed back by its reader failing.
           reader.status = 'pending'
           await delay(250, self.wait)
           continue
         }
         reader.status = 'completed'
+        reader.currentBlockIndex = undefined
         break
       }
-      // Claimed synchronously: no other reader can take it between the find and here.
-      block.status = 'downloading'
-      reader.interfaceId = this.networkOf(reader)!.id
-      block.interfaceId = reader.interfaceId
-      reader.currentBlockIndex = block.index
-      reader.status = 'downloading'
-      this.host.scheduleUpdate()
 
-      const outcome = await this.runBlock(reader, self, block)
-      const statusAfter = state.status as DownloadStatus
+      const outcome = await this.runBlockStreamed(reader, self, block, source)
       if (outcome.type === 'completed') {
         self.failures = 0
         continue
       }
-      this.handBack(block)
       if (outcome.type === 'stopped') {
-        reader.status = statusAfter === 'paused' ? 'paused' : 'cancelled'
+        reader.status = (state.status as DownloadStatus) === 'paused' ? 'paused' : 'cancelled'
+        reader.currentBlockIndex = undefined
         break
       }
       if (outcome.type === 'retry') {
@@ -231,6 +290,7 @@ export class TelegramTransfer implements Transfer {
         if ((this.runtime.state.status as DownloadStatus) !== 'downloading') {
           reader.status =
             (this.runtime.state.status as DownloadStatus) === 'paused' ? 'paused' : 'cancelled'
+          reader.currentBlockIndex = undefined
           break
         }
         continue
@@ -238,6 +298,7 @@ export class TelegramTransfer implements Transfer {
       // give-up: the reader is done, and the download fails with it.
       this.host.failDownload(describeError(outcome.error))
       reader.status = 'cancelled'
+      reader.currentBlockIndex = undefined
       break
     }
   }
@@ -247,50 +308,56 @@ export class TelegramTransfer implements Transfer {
     if (block.status === 'downloading') block.status = 'pending'
   }
 
-  private async runBlock(
+  /** The request size for a chunk at `offset` within `block`: 1 MiB mid-file, over-asked up
+   * to the 4096 alignment for a tail smaller than that (the answer is sliced down). */
+  private chunkSize(block: HttpBlockState, offset: number): number {
+    const end = block.rangeEnd === null ? Number.MAX_SAFE_INTEGER : block.rangeEnd + 1
+    const request = Math.min(FILE_CHUNK_BYTES, end - offset)
+    const aligned = Math.floor(request / 4096) * 4096
+    return aligned > 0 ? aligned : 4096
+  }
+
+  /**
+   * Fetches `firstBlock` with its connection kept full: the moment a chunk lands, the next
+   * request goes out — for the same block when it runs long, else for the next pending
+   * block, claimed then — and only then is the landed chunk written. The round trip of the
+   * next chunk thus hides behind this one's disk write. All blocks this stream claims are
+   * this function's to hand back when it stops early.
+   */
+  private async runBlockStreamed(
     reader: TelegramReaderState,
     self: ReaderRuntime,
-    block: HttpBlockState
+    firstBlock: HttpBlockState,
+    source: TelegramFileSource
   ): Promise<BlockOutcome> {
     const { state, meters } = this.runtime
-    // The source (message lookup, its location) is found on first use; failing that, the
-    // download ends with why.
-    let source: TelegramFileSource
-    try {
-      source = await this.source()
-    } catch (cause) {
-      return {
-        type: 'give-up',
-        error:
-          cause instanceof TelegramFileError
-            ? cause
-            : new TelegramFileError('missing', describeError(cause))
-      }
-    }
     const networkId = reader.interfaceId
-    const openEnded = block.rangeEnd === null
-    const end = block.rangeEnd === null ? Number.MAX_SAFE_INTEGER : block.rangeEnd + 1
-    let offset = block.rangeStart + block.bytesDownloaded
+    const endOf = (block: HttpBlockState): number =>
+      block.rangeEnd === null ? Number.MAX_SAFE_INTEGER : block.rangeEnd + 1
 
-    while (offset < end) {
-      if (self.controller.signal.aborted || (state.status as string) !== 'downloading') {
-        return { type: 'stopped' }
-      }
-      const remaining = end - offset
-      let request = Math.min(FILE_CHUNK_BYTES, remaining)
-      const aligned = Math.floor(request / 4096) * 4096
-      // Mid-file the answer is exactly the limit, which must be 4096-divisible; a tail smaller
-      // than that over-asks and slices the answer down.
-      request = aligned > 0 ? aligned : 4096
+    const fire = (block: HttpBlockState, offset: number): Prefetch => ({
+      block,
+      offset,
+      promise: source
+        .request(offset, this.chunkSize(block, offset), self.controller.signal)
+        .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))))
+    })
 
-      let buffer: Buffer
-      try {
-        buffer = await source.request(offset, request, self.controller.signal)
-      } catch (error) {
-        return this.asOutcome(self, error)
+    let prefetch: Prefetch = fire(firstBlock, firstBlock.rangeStart + firstBlock.bytesDownloaded)
+
+    while (true) {
+      const { block, offset } = prefetch
+      const settled = await prefetch.promise
+      if (settled instanceof Error) {
+        this.handBack(block)
+        if (self.controller.signal.aborted || (state.status as DownloadStatus) !== 'downloading') {
+          return { type: 'stopped' }
+        }
+        return this.asOutcome(self, settled)
       }
-      if (buffer.length === 0) {
-        if (!openEnded) {
+      if (settled.length === 0) {
+        if (block.rangeEnd !== null) {
+          this.handBack(block)
           return {
             type: 'give-up',
             error: new Error('Telegram closed this file early — resume to try again.')
@@ -305,44 +372,67 @@ export class TelegramTransfer implements Transfer {
         return { type: 'completed' }
       }
 
-      const usable = Math.min(buffer.length, remaining)
+      const remaining = endOf(block) - offset
+      const usable = Math.min(settled.length, remaining)
+      const nextOffset = offset + usable
+      const blockFinished = nextOffset >= endOf(block)
+
+      // Claim and fire the next chunk before writing this one.
+      let next: Prefetch | undefined
+      if ((state.status as DownloadStatus) === 'downloading' && !self.controller.signal.aborted) {
+        if (!blockFinished) {
+          next = fire(block, nextOffset)
+        } else {
+          const claimed = this.claimBlock(reader)
+          if (claimed) next = fire(claimed, claimed.rangeStart + claimed.bytesDownloaded)
+        }
+      }
+
       try {
         await this.host.limits.take(networkId, usable)
-        await this.write(offset, buffer.subarray(0, usable))
+        await this.write(offset, settled.subarray(0, usable))
       } catch (error) {
-        // The write side (a full disk, a dropped drive) isn't Telegram's doing: end the download
-        // with what it says, keeping the download resumable.
+        // The write side (a full disk, a dropped drive) isn't Telegram's doing: end the
+        // download with what it says, keeping the download resumable.
+        if (next) await next.promise
         this.handBack(block)
+        if (next && next.block !== block) this.handBack(next.block)
         this.host.failDownload(describeError(error))
         return { type: 'stopped' }
       }
 
-      const gained = advanceBlock(block, networkId, offset + usable - block.rangeStart)
+      const gained = advanceBlock(block, networkId, nextOffset - block.rangeStart)
       if (gained > 0) {
         state.bytesDownloaded += gained
         reader.bytesDownloaded += gained
         meters.add(reader.id, networkId, gained)
       }
-      offset += usable
+      if (blockFinished && block.rangeEnd !== null) {
+        advanceBlock(block, networkId, block.rangeEnd - block.rangeStart + 1)
+        block.status = 'completed'
+        recomputeAggregates(state, this.runtime.blocks)
+      }
       this.host.scheduleUpdate()
-    }
 
-    if (block.rangeEnd !== null) {
-      advanceBlock(block, networkId, block.rangeEnd - block.rangeStart + 1)
+      if (next) {
+        prefetch = next
+        continue
+      }
+      if (blockFinished) return { type: 'completed' }
+      // Nothing more to claim (the download may be ending) — the unfinished block is this
+      // reader's still, so its next chunk goes out now rather than never.
+      prefetch = fire(block, nextOffset)
     }
-    block.status = 'completed'
-    recomputeAggregates(state, this.runtime.blocks)
-    this.host.scheduleUpdate()
-    return { type: 'completed' }
   }
 
-  /** Reads failure kinds the transfer acts on; 'rate' becomes a wait, the rest retries or end
-   * the download. */
+  /** Reads failure kinds the transfer acts on: a rate limit becomes a wait every reader
+   * shares, auth and missing files end the download, the rest retry on this reader. */
   private asOutcome(self: ReaderRuntime, error: unknown): BlockOutcome {
     if (error instanceof TelegramFileError) {
       if (error.kind === 'rate') {
         const waitMs = (error.waitSeconds ?? 1) * 1000
         if (waitMs > RATE_WAIT_MAX_MS) return { type: 'give-up', error }
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + waitMs)
         return { type: 'retry', waitMs }
       }
       if (error.kind === 'auth' || error.kind === 'missing') {
